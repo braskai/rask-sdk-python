@@ -1,0 +1,76 @@
+name: CI
+
+# Builds, lints and tests. Nothing here publishes: release.yml calls this before it does.
+on:
+  pull_request:
+  push:
+    branches: [main, initial]
+  schedule:
+    - cron: "17 3 * * *" # the slow scenarios, nightly
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build-lint-unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: make lint
+      - run: make test-unit
+      - run: make build
+
+  floor:
+    # The lowest dependency versions pyproject.toml promises.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked
+      - run: uv pip install "httpx==0.27.0" "pydantic==2.10.0" "typing-extensions==4.12.2"
+      - run: uv run --no-sync pytest tests/unit
+
+  acceptance:
+    # The shared acceptance harness is its own repository.
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: braskai/rask-sdk-acceptance
+          path: rask-sdk-acceptance
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv sync --locked
+      - run: make test-acceptance
+        env:
+          RASK_SDK_ACCEPTANCE_DIR: ${{ github.workspace }}/rask-sdk-acceptance
+          RASK_SDK_ACCEPTANCE_REQUIRED: "1"
+          RUN_SLOW: ${{ github.event_name == 'schedule' && '1' || '' }}
