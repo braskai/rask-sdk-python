@@ -38,8 +38,9 @@ test:
 test-unit:
 	uv run pytest tests/unit
 
+# Without the harness the tests skip. Here that is a failure: nothing else is asked of this target.
 test-acceptance:
-	uv run pytest tests/acceptance
+	RASK_SDK_ACCEPTANCE_REQUIRED=1 uv run pytest tests/acceptance
 
 build:
 	uv build

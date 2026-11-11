@@ -6,6 +6,7 @@ from typing import Dict
 from typing import List
 from typing import Optional
 
+from anyio import Lock  # httpx brings anyio, and Authlib takes its own lock from there
 from authlib.integrations.base_client import OAuthError  # type: ignore[import-untyped]
 from authlib.integrations.httpx_client import AsyncOAuth2Client  # type: ignore[import-untyped]
 from httpx import HTTPStatusError
@@ -31,6 +32,18 @@ class RaskSDKClient:
             scope=["api/source", "api/input", "api/output", "api/limit"],
             token_endpoint="https://rask-prod.auth.us-east-2.amazoncognito.com/oauth2/token",
         )
+        self._auth_lock = Lock()
+
+    async def aclose(self) -> None:
+        """Close the HTTP client and the connections it holds."""
+
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "RaskSDKClient":
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        await self.aclose()
 
     @staticmethod
     def _raise_for_status(response: Response) -> None:
@@ -45,6 +58,10 @@ class RaskSDKClient:
                 raise RaskClientException(
                     status_code=response.status_code, detail="Unknown error occurred."
                 ) from exc
+
+            # A proxy may answer with a JSON list, string or null, which has no detail to read.
+            if not isinstance(err_detail, dict):
+                err_detail = {}
 
             raise RaskClientException(
                 status_code=response.status_code,
@@ -169,7 +186,7 @@ class RaskSDKClient:
         """Patch project."""
 
         project = await self._client.patch(
-            f"{self._base_url}v2/projects/{str(project_id)}",
+            f"{self._base_url}/v2/projects/{str(project_id)}",
             json=data.model_dump(mode="json"),
         )
         self._raise_for_status(response=project)

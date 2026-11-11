@@ -215,6 +215,10 @@ class SegmentPatch(pydantic.BaseModel):
 
         validate_speaker(speaker=speaker)
 
+        if speaker is not None:
+            speaker = speaker.strip()
+            values["speaker"] = speaker
+
         if start is None and end is None:
             return values
 
@@ -231,9 +235,6 @@ class SegmentPatch(pydantic.BaseModel):
 
         start = start.strip()
         end = end.strip()
-
-        if speaker is not None:
-            speaker = speaker.strip()
 
         validate_start_end_timestamps(start=start, end=end)
 

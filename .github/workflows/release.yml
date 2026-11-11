@@ -46,25 +46,29 @@ jobs:
         with:
           python-version: "3.13"
           enable-cache: false
-      - name: The version is new
+      - name: The version is not released yet
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          # The tag is made last, so it is the tag that says a release is complete. A version without one whose files
+          # PyPI already has is a release that stopped half way, and this run finishes it.
           tagged=0
           git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null || tagged=$?
-          published=$(curl -sS -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/rask-sdk/$version/json")
-          if [ "$tagged" != 2 ] || [ "$published" != 404 ]; then
-            echo "::error::$version is already released, or that could not be checked (tag lookup $tagged, where 2 means no tag; PyPI answered $published). Set the next version in pyproject.toml and rask_sdk/_version.py first."
+          if [ "$tagged" != 2 ]; then
+            echo "::error::$version is already released, or that could not be checked (tag lookup $tagged, where 2 means no tag). Set the next version in pyproject.toml and rask_sdk/_version.py first."
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - run: uv build
-      - run: uv publish --trusted-publishing always
+      # With the check URL a file PyPI already has is skipped when it is the same bytes, so a second run uploads only
+      # what the first did not. A file PyPI has with other bytes stops the run.
+      - run: uv publish --trusted-publishing always --check-url https://pypi.org/simple/
       - name: Tag the version and make the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -- "v$VERSION" --target "$GITHUB_SHA" --generate-notes
-          # A pre-release has a letter in its version: 3.0.0a0, 3.0.0rc1.
-          case "$VERSION" in *[a-z]*) set -- "$@" --prerelease ;; esac
+          # A pre-release has a letter in its version: 3.0.0a0, 3.0.0rc1, 3.0.0.dev1. The letters of a post-release
+          # do not make it one: 3.0.0.post1.
+          case "${VERSION//post/}" in *[a-z]*) set -- "$@" --prerelease ;; esac
           gh release create "$@"

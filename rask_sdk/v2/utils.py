@@ -14,7 +14,13 @@ def retry_on_auth_error():
             try:
                 return await func(instance, *args, **kwargs)
             except (MissingTokenError, MissingRequestTokenError, TokenExpiredError):
-                await instance.authenticate()
+                token = instance._client.token
+
+                # Calls that fail together wait here, and the token the first of them fetches serves the rest.
+                async with instance._auth_lock:
+                    if instance._client.token is token:
+                        await instance.authenticate()
+
                 return await func(instance, *args, **kwargs)
 
         return wrapper

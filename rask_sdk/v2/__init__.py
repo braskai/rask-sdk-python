@@ -1,4 +1,4 @@
-"""The API v2 client (Cognito client credentials), kept unchanged beside the v3 SDK for migration.
+"""The API v2 client (Cognito client credentials), kept beside the v3 SDK for migration.
 
 Requires the ``v2`` extra: ``pip install "rask-sdk[v2]"``. New code should use ``from rask_sdk import Rask``.
 """

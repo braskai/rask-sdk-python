@@ -80,10 +80,11 @@ Operations are grouped by the contract's tags and named after their `operationId
   `None` means "leave it out", and requests never send null.
 - **Errors:** `RaskError` and one subclass per status (`InsufficientBalanceError`, `RateLimitError`, ...) carry every Problem
   member as an attribute, plus `headers`, `request_id` and `idempotency_key`. Unknown codes are kept.
-- **Retries:** 429, 502, 503, 504, connection errors and timeouts, for up to 120 s, honouring `Retry-After`. Writes keep their
-  `Idempotency-Key` across retries; pass `idempotency_key=` to choose it. `max_retries=0` turns retries off. A certificate
-  that fails verification is not retried: the call and `jobs.wait` raise `RaskConnectionError` at once, with httpx's error
-  as its `__cause__`.
+- **Retries:** 429, 502, 503, 504, connection errors and timeouts, for up to 120 s from the start of the call, honouring
+  `Retry-After`. That limits the retries, not the call: the first attempt has the whole `timeout` (60 s by default).
+  Writes keep their `Idempotency-Key` across retries; pass `idempotency_key=` to choose it. `max_retries=0` turns retries
+  off. A certificate that fails verification is not retried: the call and `jobs.wait` raise `RaskConnectionError` at once,
+  with httpx's error as its `__cause__`.
 - **Forward compatibility:** an enum value, a union variant (`rask_sdk.UnknownVariant`) or a field this version does not
   know stays readable on the result and never fails the call. `extra_body=`, `extra_query=` and `extra_headers=` send what
   it does not know yet.
@@ -92,7 +93,7 @@ Operations are grouped by the contract's tags and named after their `operationId
 
 ## The API v2 client
 
-The previous client talks to API v2 and stays available beside this one while you migrate, unchanged but for its import:
+The previous client talks to API v2 and stays available beside this one while you migrate. Only its import changes:
 
 ```python
 # pip install "rask-sdk[v2]"

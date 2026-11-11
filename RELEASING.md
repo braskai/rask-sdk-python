@@ -13,10 +13,18 @@ A release is one run of the `Release` workflow. It publishes the package to PyPI
 3. The workflow runs the CI checks, builds the sdist and the wheel, publishes `rask-sdk` to PyPI, then tags the commit
    `v` plus the version and makes the GitHub Release.
 
-The workflow refuses to run from any other branch, and refuses a version that is already tagged or already on PyPI.
-PyPI never takes the same file name twice, even after a release is deleted: to fix a version, release the next.
-If a run fails after PyPI took the version, make the release by hand:
-`gh release create v<version> --target <the commit> --generate-notes`, with `--prerelease` for a pre-release version.
+The workflow refuses to run from any other branch, and refuses a version that already has its tag. The tag is made
+last, so a version with a tag is a finished release. PyPI never takes the same file name twice, even after a release is
+deleted: to fix a version, release the next.
+
+If a run stops after PyPI took one of the files or both, run it again on the same commit: "Re-run failed jobs" on that
+run, or a new run if nothing was merged since. It builds the same files, skips those PyPI already has, uploads the
+rest, then tags the commit and makes the GitHub Release.
+
+A file that PyPI has with other bytes stops the run before it is uploaded: the commit or the build tools are no longer
+those of the first run. If PyPI then has both files, only the tag is missing, and it is made by hand:
+`gh release create v<version> --target <the commit of the first run> --generate-notes`, with `--prerelease` for a
+pre-release version. If it has one, release the next version.
 
 ## Set up once
 
