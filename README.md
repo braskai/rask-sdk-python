@@ -12,8 +12,6 @@ Python 3.11 or newer.
 pip install rask-sdk
 ```
 
-Before the first release is on PyPI, install from a checkout of this repository instead, with `pip install .`.
-
 ## Key and base URL
 
 `Rask()` reads `RASK_API_KEY` and `RASK_BASE_URL`, and an argument wins over its variable.
