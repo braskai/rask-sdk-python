@@ -6,10 +6,11 @@ import asyncio
 import datetime
 import logging
 import pprint
+import ssl
 import subprocess
 import sys
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import httpx
@@ -54,6 +55,49 @@ def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 def client_with(handler: Any, **kwargs: Any) -> Rask:
     return Rask(api_key=KEY, base_url=BASE, http_client=httpx.Client(transport=httpx.MockTransport(handler)), **kwargs)
+
+
+BOTH_CLIENTS = pytest.mark.parametrize("kind", ["sync", "async"])
+
+
+@pytest.fixture
+def slept(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Neither client really sleeps: the waits it asks for are recorded."""
+    waits: list[float] = []
+
+    async def record(seconds: float) -> None:
+        waits.append(seconds)
+
+    monkeypatch.setattr("rask_sdk._client.time.sleep", waits.append)
+    monkeypatch.setattr("rask_sdk._client.asyncio.sleep", record)
+    return waits
+
+
+def on_client(kind: str, handler: Any, use: Callable[[Any], Any], **kwargs: Any) -> Any:
+    """What `use` makes of the sync or the async client. On the async one it returns an awaitable."""
+    if kind == "sync":
+        return use(client_with(handler, **kwargs))
+
+    async def drive() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            return await use(AsyncRask(api_key=KEY, base_url=BASE, http_client=http, **kwargs))
+
+    return asyncio.run(drive())
+
+
+def certificate_failure() -> httpx.ConnectError:
+    """What httpx raises for a certificate that fails verification, in the shape test_certificates.py meets over TLS.
+
+    The ConnectError's cause is the HTTP core's own error. That one has no cause, since the connection pool raises it
+    again `from None`, and the ssl error is its context.
+    """
+    text = "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate (_ssl.c:1010)"
+    core = OSError(text)
+    core.__context__ = ssl.SSLCertVerificationError(1, text)
+    core.__suppress_context__ = True
+    error = httpx.ConnectError(text)
+    error.__cause__ = core
+    return error
 
 
 def test_key_missing_names_the_variable() -> None:
@@ -181,6 +225,34 @@ def test_backoff_stays_in_its_range() -> None:
             assert nominal * 0.75 <= backoff_seconds(attempt) <= nominal * 1.25
 
 
+def test_backoff_is_still_a_wait_past_what_a_float_holds() -> None:
+    # 1.5 to the power of 1751 does not fit a float, and Python raises there where other languages give infinity.
+    for attempt in (1750, 1751, 5000, 10**6):
+        assert 30 * 0.75 <= backoff_seconds(attempt) <= 30 * 1.25
+
+
+@BOTH_CLIENTS
+def test_wait_keeps_its_backoff_through_a_long_outage(
+    kind: str, slept: list[float], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The count of failed polls is the exponent, and only the wait's own timeout bounds it. A steeper factor gets to
+    # the float's limit in 11 polls instead of 1751.
+    monkeypatch.setattr(flow_module, "BACKOFF_FACTOR", 1e30)
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        polls += 1
+        if polls <= 15:
+            raise httpx.ConnectError("x")
+        return httpx.Response(200, json={"object": "job", "id": "j", "status": "succeeded"})
+
+    job = on_client(kind, handler, lambda client: client.jobs.wait("j"), max_retries=0)
+    assert job.status == "succeeded"
+    assert len(slept) == 15
+    assert max(slept) <= 30 * 1.25
+
+
 @pytest.mark.parametrize(
     ("exception", "kind"),
     [(httpx.ConnectError("x"), RaskConnectionError), (httpx.ReadTimeout("x"), RaskTimeoutError)],
@@ -209,6 +281,81 @@ def test_unsupported_protocol_is_not_retried() -> None:
     assert calls == 1
 
 
+@BOTH_CLIENTS
+def test_a_certificate_that_fails_verification_is_not_retried(kind: str, slept: list[float]) -> None:
+    failure = certificate_failure()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        raise failure
+
+    with pytest.raises(RaskConnectionError) as caught:
+        on_client(kind, handler, lambda client: client.account.get_me(), max_retries=2)
+    assert calls == 1
+    assert slept == []
+    assert caught.value.__cause__ is failure
+
+
+@BOTH_CLIENTS
+def test_wait_ends_on_a_certificate_that_fails_verification(kind: str, slept: list[float]) -> None:
+    failure = certificate_failure()
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        polls += 1
+        raise failure
+
+    with pytest.raises(RaskConnectionError) as caught:
+        on_client(kind, handler, lambda client: client.jobs.wait("j", timeout=5))
+    assert polls == 1
+    assert slept == []
+    assert caught.value.__cause__ is failure
+
+
+def tls_failure_of_another_kind() -> httpx.ConnectError:
+    error = httpx.ConnectError("[SSL: TLSV1_ALERT_INTERNAL_ERROR] tlsv1 alert internal error (_ssl.c:1010)")
+    error.__cause__ = ssl.SSLError(1, str(error))
+    return error
+
+
+def failure_while_the_caller_handled_a_certificate() -> httpx.ConnectError:
+    """A refused connection, met by a caller that was handling a certificate error of its own when it made the call.
+
+    Python hangs that error on the innermost one as its context. It says nothing about this connection.
+    """
+    refused = ConnectionRefusedError(61, "Connection refused")
+    refused.__context__ = ssl.SSLCertVerificationError(1, "certificate verify failed: certificate has expired")
+    core = OSError(str(refused))
+    core.__context__ = refused
+    core.__suppress_context__ = True
+    error = httpx.ConnectError(str(refused))
+    error.__cause__ = core
+    return error
+
+
+@BOTH_CLIENTS
+@pytest.mark.parametrize("make", [tls_failure_of_another_kind, failure_while_the_caller_handled_a_certificate])
+def test_what_is_not_known_for_a_certificate_failure_is_still_retried(
+    kind: str, make: Callable[[], httpx.ConnectError], slept: list[float]
+) -> None:
+    failure = make()
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            raise failure
+        return httpx.Response(200, json={})
+
+    on_client(kind, handler, lambda client: client.account.get_me())
+    assert calls == 3
+    assert len(slept) == 2
+
+
 def test_retry_after_forms() -> None:
     assert parse_retry_after("5") == 5
     assert parse_retry_after(None) is None
@@ -217,6 +364,71 @@ def test_retry_after_forms() -> None:
     assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT") == 0
     future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=100)
     assert 90 < (parse_retry_after(future.strftime("%a, %d %b %Y %H:%M:%S GMT")) or 0) <= 100
+
+
+@pytest.mark.parametrize("value", ["2147483649", "1e20", "1e400", "inf", "Infinity", "Fri, 31 Dec 9999 23:59:59 GMT"])
+def test_retry_after_is_capped(value: str) -> None:
+    # 2^31 s, what HTTP takes for a number of seconds too large to hold: a sleep takes it, and a time adds to it.
+    assert parse_retry_after(value) == 2**31
+
+
+@pytest.mark.parametrize("value", ["nan", "NaN", "-nan", "-inf", "-1e400"])
+def test_retry_after_that_is_no_wait_is_unreadable(value: str) -> None:
+    assert parse_retry_after(value) is None
+
+
+def test_retry_after_dates_the_standard_library_reads_oddly() -> None:
+    # Without a zone, or with -0000, the date comes back with no zone at all: subtracting from now would raise.
+    assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 -0000") == 0
+    assert parse_retry_after("Wed, 21 Oct 2015 07:28:00") == 0
+    future = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=100)
+    assert 90 < (parse_retry_after(future.strftime("%a, %d %b %Y %H:%M:%S -0000")) or 0) <= 100
+    # A zone or a year of twenty digits overflows inside the parser.
+    assert parse_retry_after("Wed, 21 Oct 2015 07:28:00 +99999999999999999999") is None
+    assert parse_retry_after("Wed, 21 Oct 99999999999999999999 07:28:00 GMT") is None
+
+
+@BOTH_CLIENTS
+def test_a_retry_after_date_without_a_zone_does_not_break_the_error(kind: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 -0000"})
+
+    with pytest.raises(ServerError) as caught:
+        on_client(kind, handler, lambda client: client.account.get_me(), max_retries=0)
+    assert caught.value.retry_after == 0
+
+
+@BOTH_CLIENTS
+@pytest.mark.parametrize("header", ["inf", "1e400", "Fri, 31 Dec 9999 23:59:59 GMT"])
+def test_a_retry_after_past_any_budget_ends_the_retries_at_once(kind: str, header: str, slept: list[float]) -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(429, headers={"Retry-After": header})
+
+    with pytest.raises(RaskError) as caught:
+        on_client(kind, handler, lambda client: client.account.get_me())
+    assert calls == 1
+    assert slept == []
+    assert caught.value.retry_after == 2**31
+
+
+@BOTH_CLIENTS
+def test_wait_reads_a_retry_after_date_without_a_zone(kind: str, slept: list[float]) -> None:
+    statuses = iter(["running", "succeeded"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"object": "job", "id": "j", "status": next(statuses)},
+            headers={"Retry-After": "Wed, 21 Oct 2015 07:28:00 -0000"},
+        )
+
+    job = on_client(kind, handler, lambda client: client.jobs.wait("j"))
+    assert job.status == "succeeded"
+    assert slept == [0]
 
 
 def test_error_classes_by_status() -> None:
@@ -311,6 +523,44 @@ def test_wait_does_not_survive_a_real_error(no_sleep: list[float]) -> None:
         client_with(handler).jobs.wait("j")
 
 
+@BOTH_CLIENTS
+@pytest.mark.parametrize("failure", [httpx.UnsupportedProtocol("x"), httpx.LocalProtocolError("x")], ids=repr)
+def test_wait_ends_on_a_failure_the_call_does_not_retry(kind: str, failure: Exception, slept: list[float]) -> None:
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal polls
+        polls += 1
+        raise failure
+
+    with pytest.raises(RaskConnectionError) as caught:
+        on_client(kind, handler, lambda client: client.jobs.wait("j", timeout=5))
+    assert polls == 1
+    assert slept == []
+    assert caught.value.__cause__ is failure
+
+
+@BOTH_CLIENTS
+def test_wait_outlives_a_connection_that_fails_for_a_while(kind: str, slept: list[float]) -> None:
+    answers: Iterator[Exception | httpx.Response] = iter(
+        [
+            httpx.ConnectError("x"),
+            httpx.ReadTimeout("x"),
+            httpx.Response(200, json={"object": "job", "id": "j", "status": "succeeded"}),
+        ]
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        answer = next(answers)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    job = on_client(kind, handler, lambda client: client.jobs.wait("j"), max_retries=0)
+    assert job.status == "succeeded"
+    assert len(slept) == 2
+
+
 def test_wait_timeout_keeps_the_last_job() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"object": "job", "id": "j", "status": "running"}, headers={"Retry-After": "5"})
@@ -343,6 +593,45 @@ def test_wait_shortens_the_long_poll_under_a_short_client_timeout() -> None:
     )
     client.jobs.wait("j")
     assert seen[0].url.params["wait_seconds"] == "5"
+
+
+@BOTH_CLIENTS
+@pytest.mark.parametrize("following", [{None: "A", "A": "A"}, {None: "A", "A": "B", "B": "A"}], ids=["A-A", "A-B-A"])
+def test_a_cursor_the_list_gives_twice_ends_the_walk(kind: str, following: dict[str | None, str]) -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        seen.append(cursor)
+        assert len(seen) < 10, "The walk follows a cursor it has already followed."
+        return httpx.Response(
+            200,
+            json={
+                "object": "list",
+                "data": [{"id": f"after-{cursor}"}],
+                "has_more": True,
+                "next_cursor": following[cursor],
+            },
+            headers={"X-Request-Id": f"req-{len(seen)}"},
+        )
+
+    walked: list[str] = []
+
+    def walk(client: Rask) -> None:
+        for project in client.projects.list_projects():
+            walked.append(project.id)
+
+    async def walk_async(client: AsyncRask) -> None:
+        async for project in await client.projects.list_projects():
+            walked.append(project.id)
+
+    with pytest.raises(RaskError, match="already given") as caught:
+        on_client(kind, handler, walk if kind == "sync" else walk_async)
+    # Each page was fetched once and its items were handed out before the walk ended.
+    assert seen == list(following)
+    assert walked == [f"after-{cursor}" for cursor in following]
+    assert caught.value.status == 200
+    assert caught.value.request_id == f"req-{len(following)}"
 
 
 def test_deprecation_warning_is_visible_by_default_and_once_per_operation() -> None:

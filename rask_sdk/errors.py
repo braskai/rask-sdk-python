@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from typing import Any
 
@@ -73,7 +74,11 @@ class RaskConfigError(RaskError, ValueError):
 
 
 class RaskConnectionError(RaskError):
-    """The request never produced a response: the connection failed, and retrying did not help."""
+    """The request never produced a response: the connection failed, and retrying did not help.
+
+    A failure that no retry mends is raised at once: a certificate that fails verification, for one. `__cause__` holds
+    the httpx error, which says what happened.
+    """
 
 
 class RaskTimeoutError(RaskConnectionError):
@@ -239,8 +244,13 @@ def class_for_status(status: int) -> type[RaskError]:
     return ServerError if status >= 500 else RaskError
 
 
+# The longest wait Retry-After is read as: 2^31 s, what HTTP takes for a number of seconds too large to hold (RFC 9111,
+# 1.2.2). It is about 68 years, so a sleep takes it and a time can still be added to it. Infinity fits neither.
+MAX_RETRY_AFTER_SECONDS = float(2**31)
+
+
 def parse_retry_after(value: str | None) -> float | None:
-    """Retry-After in seconds or as an HTTP date. None when absent or unreadable."""
+    """Retry-After in seconds or as an HTTP date, at most 2^31 s. None when absent, unreadable or negative."""
     if value is None:
         return None
     value = value.strip()
@@ -252,10 +262,16 @@ def parse_retry_after(value: str | None) -> float | None:
 
         try:
             when = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):  # OverflowError: a year or a zone of twenty digits
             return None
-        return max(0.0, (when - datetime.now(UTC)).total_seconds())
-    return seconds if seconds >= 0 else None
+        if when.tzinfo is None:
+            # Without a zone, or with -0000, the parser gives a time with no zone. An HTTP date is in GMT.
+            when = when.replace(tzinfo=UTC)
+        return min(max(0.0, (when - datetime.now(UTC)).total_seconds()), MAX_RETRY_AFTER_SECONDS)
+    # float() reads "nan", and no comparison with it is true.
+    if math.isnan(seconds) or seconds < 0:
+        return None
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
 __all__ = [

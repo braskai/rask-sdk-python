@@ -56,12 +56,14 @@ project_id = job.result.project_id
 if job.result.auto_dub.dub_job_id:
     client.jobs.wait(job.result.auto_dub.dub_job_id)
 
-# Download. Output URLs are presigned and take no API key.
+# Download. Output URLs are presigned and take no API key. A link that has expired answers with an error, not a video.
 for output in client.exports.list_project_outputs(project_id).data:
     if output.kind == "dubbed_video" and output.available:
-        with httpx.stream("GET", output.url) as response, open("talk.es.mp4", "wb") as file:
-            for chunk in response.iter_bytes():
-                file.write(chunk)
+        with httpx.stream("GET", output.url) as response:
+            response.raise_for_status()
+            with open("talk.es.mp4", "wb") as file:
+                for chunk in response.iter_bytes():
+                    file.write(chunk)
 ```
 
 ## Using it
@@ -79,7 +81,9 @@ Operations are grouped by the contract's tags and named after their `operationId
 - **Errors:** `RaskError` and one subclass per status (`InsufficientBalanceError`, `RateLimitError`, ...) carry every Problem
   member as an attribute, plus `headers`, `request_id` and `idempotency_key`. Unknown codes are kept.
 - **Retries:** 429, 502, 503, 504, connection errors and timeouts, for up to 120 s, honouring `Retry-After`. Writes keep their
-  `Idempotency-Key` across retries; pass `idempotency_key=` to choose it. `max_retries=0` turns retries off.
+  `Idempotency-Key` across retries; pass `idempotency_key=` to choose it. `max_retries=0` turns retries off. A certificate
+  that fails verification is not retried: the call and `jobs.wait` raise `RaskConnectionError` at once, with httpx's error
+  as its `__cause__`.
 - **Forward compatibility:** an enum value, a union variant (`rask_sdk.UnknownVariant`) or a field this version does not
   know stays readable on the result and never fails the call. `extra_body=`, `extra_query=` and `extra_headers=` send what
   it does not know yet.

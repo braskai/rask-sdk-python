@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from typing import Any, Generic, TypeVar
 
 from ._models import HttpInfo
+from .errors import RaskError
 
 T = TypeVar("T")
 
@@ -38,6 +39,20 @@ class _BasePage(Generic[T]):
         result: dict[str, Any] = self._listing.to_dict()
         return result
 
+    def _refuse_repeat(self, given: set[str]) -> None:
+        """Raise if this page's next_cursor was already given on the walk: following it again would never end."""
+        cursor = self.next_cursor
+        if not cursor:
+            return
+        if cursor in given:
+            http = self.http
+            raise RaskError(
+                "The list gave a cursor it had already given, so walking it would never end.",
+                status=http.status if http is not None else None,
+                headers=http.headers if http is not None else None,
+            )
+        given.add(cursor)
+
     def __getattr__(self, name: str) -> Any:
         # Anything else on the list object, unknown fields included.
         if name.startswith("__") or name == "_listing":
@@ -49,7 +64,10 @@ class _BasePage(Generic[T]):
 
 
 class Page(_BasePage[T]):
-    """One page of a list. `for item in page` keeps fetching until next_cursor is null."""
+    """One page of a list. `for item in page` keeps fetching until next_cursor is null.
+
+    A cursor the list has already given on the walk raises RaskError, after the items of its page.
+    """
 
     def __init__(self, listing: Any, fetch: Callable[[str], Page[T]]) -> None:
         super().__init__(listing)
@@ -63,8 +81,11 @@ class Page(_BasePage[T]):
     def iter_pages(self) -> Iterator[Page[T]]:
         """This page and each one after it."""
         page: Page[T] | None = self
+        # Every cursor given on this walk, not only the last: a cycle such as A, B, A never repeats one in a row.
+        given: set[str] = set()
         while page is not None:
             yield page
+            page._refuse_repeat(given)
             page = page.next_page()
 
     def __iter__(self) -> Iterator[T]:
@@ -73,7 +94,10 @@ class Page(_BasePage[T]):
 
 
 class AsyncPage(_BasePage[T]):
-    """One page of a list. `async for item in page` keeps fetching until next_cursor is null."""
+    """One page of a list. `async for item in page` keeps fetching until next_cursor is null.
+
+    A cursor the list has already given on the walk raises RaskError, after the items of its page.
+    """
 
     def __init__(self, listing: Any, fetch: Callable[[str], Awaitable[AsyncPage[T]]]) -> None:
         super().__init__(listing)
@@ -87,8 +111,11 @@ class AsyncPage(_BasePage[T]):
     async def iter_pages(self) -> AsyncIterator[AsyncPage[T]]:
         """This page and each one after it."""
         page: AsyncPage[T] | None = self
+        # Every cursor given on this walk, not only the last: a cycle such as A, B, A never repeats one in a row.
+        given: set[str] = set()
         while page is not None:
             yield page
+            page._refuse_repeat(given)
             page = await page.next_page()
 
     async def __aiter__(self) -> AsyncIterator[T]:

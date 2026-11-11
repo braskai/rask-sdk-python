@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import random
+import ssl
 import time
 import uuid
 from collections.abc import Generator, Mapping, Sequence
@@ -57,6 +58,9 @@ PUT_RETRIES = 3
 MAX_RESIGNS = 3
 
 _NOT_RETRYABLE = (httpx.UnsupportedProtocol, httpx.LocalProtocolError, httpx.TooManyRedirects)
+# A transport of the caller's may wrap an error in its own, and a chain of causes can lead back to itself.
+_CAUSE_DEPTH = 5
+MAX_PORT = 65535
 
 
 @dataclass(slots=True)
@@ -91,7 +95,41 @@ class RawResult:
 
 def backoff_seconds(attempt: int) -> float:
     """Exponential from 0.5 s to 30 s, factor 1.5, with jitter."""
-    return min(BACKOFF_FIRST_SECONDS * BACKOFF_FACTOR**attempt, BACKOFF_MAX_SECONDS) * random.uniform(0.75, 1.25)
+    try:
+        nominal = min(BACKOFF_FIRST_SECONDS * BACKOFF_FACTOR**attempt, BACKOFF_MAX_SECONDS)
+    except OverflowError:
+        # A power too large for a float raises here, where other languages give infinity. jobs.wait counts the polls of
+        # an outage as attempts, and only its own timeout bounds that count.
+        nominal = BACKOFF_MAX_SECONDS
+    return nominal * random.uniform(0.75, 1.25)
+
+
+def _is_certificate_failure(exc: BaseException | None) -> bool:
+    """Whether a send failed on a certificate that fails verification: self-signed, expired, for another host name.
+
+    httpx raises ConnectError for it, as for a refused connection. The ssl error is two links down: the cause is the
+    HTTP core's own ConnectError, which its connection pool raises again `from None`, and the ssl error is the context
+    that leaves behind. A context that Python attached by itself is not followed: it may be an error the caller was
+    handling when it made the call, which says nothing about this one.
+    """
+    for _ in range(_CAUSE_DEPTH):
+        if exc is None:
+            return False
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            return True
+        exc = exc.__context__ if exc.__cause__ is None and exc.__suppress_context__ else exc.__cause__
+    return False
+
+
+def _may_pass(exc: BaseException | None) -> bool:
+    """Whether a send that failed may work on a later attempt. What is not recognised here may, and is retried."""
+    if isinstance(exc, _NOT_RETRYABLE):
+        return False
+    # httpx makes a request of every redirect, followed or not, and raises this when the Location is no URL. The
+    # response is lost with it, so the redirect cannot be the answer here, but another attempt would only get it again.
+    if isinstance(exc, httpx.RemoteProtocolError) and isinstance(exc.__context__, httpx.InvalidURL):
+        return False
+    return not _is_certificate_failure(exc)
 
 
 def to_jsonable(value: Any) -> Any:
@@ -162,6 +200,19 @@ def _encode_body(op: Operation, body: Any, extra_body: Mapping[str, Any] | None)
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def _redirect_target(url: str, location: str) -> str | None:
+    """Where a redirect leads, or None when no request can be made of its Location: the redirect is then the answer."""
+    try:
+        target = httpx.URL(url).join(location)
+    except httpx.InvalidURL:
+        return None
+    # Sent on, a URL without a host or with a port no socket has fails inside the HTTP client like a network that is
+    # down, and would be retried as one, though the next attempt gets the same Location.
+    if target.scheme not in ("http", "https") or not target.host or (target.port or 0) > MAX_PORT:
+        return None
+    return str(target)
+
+
 def _follow_redirects(
     config: ClientConfig,
     op: Operation,
@@ -193,8 +244,8 @@ def _follow_redirects(
         status = response.status_code
         if status not in (301, 302, 303, 307, 308) or not location or hop == MAX_REDIRECTS:
             return response
-        target = str(httpx.URL(url).join(location))
-        if httpx.URL(target).scheme not in ("http", "https"):
+        target = _redirect_target(url, location)
+        if target is None:
             return response
         safe_method = method in ("GET", "HEAD")
         # 301, 302 and 303 turn a write into a GET, which would quietly answer something else. A write that leaves the
@@ -284,7 +335,7 @@ def request_flow(
             response = yield from _follow_redirects(config, op, url, headers, content, attempt_timeout)
         except httpx.RequestError as exc:
             failure = _connection_error(config, op, url, exc, key)
-            retry = not isinstance(exc, _NOT_RETRYABLE)
+            retry = _may_pass(exc)
         else:
             config.warn_deprecated(op.id, response.headers)
             status = response.status_code
@@ -347,7 +398,11 @@ def call_flow(config: ClientConfig, op: Operation, model: type[Any], **kwargs: A
 
 
 def _is_retryable_failure(error: RaskError) -> bool:
-    return isinstance(error, RaskConnectionError) or error.status in RETRY_STATUSES
+    if isinstance(error, RaskConnectionError):
+        # What the call itself does not retry is the same on the next poll. Taken for an outage, it would come back
+        # when the wait ran out, as a timeout.
+        return _may_pass(error.__cause__)
+    return error.status in RETRY_STATUSES
 
 
 def wait_flow(config: ClientConfig, job_id: str, *, timeout: float) -> Flow:

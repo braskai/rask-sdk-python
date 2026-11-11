@@ -45,18 +45,44 @@ class UploadSource:
 
 def _spool(chunks: Iterable[bytes]) -> Any:
     spool = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY_BYTES)  # noqa: SIM115
-    for chunk in chunks:
-        spool.write(chunk)
-    spool.seek(0)
+    try:
+        for chunk in chunks:
+            spool.write(chunk)
+        spool.seek(0)
+    except BaseException:
+        # Nobody else holds the copy yet. Left to the garbage collector, it keeps its descriptor and its disk space
+        # for as long as the error is held.
+        spool.close()
+        raise
     return spool
 
 
 async def spool_async(chunks: AsyncIterable[bytes]) -> Any:
     spool = tempfile.SpooledTemporaryFile(max_size=_SPOOL_IN_MEMORY_BYTES)  # noqa: SIM115
-    async for chunk in chunks:
-        spool.write(chunk)
-    spool.seek(0)
+    try:
+        async for chunk in chunks:
+            spool.write(chunk)
+        spool.seek(0)
+    except BaseException:
+        spool.close()
+        raise
     return spool
+
+
+def _rewinds(stream: Any) -> bool:
+    """Whether a stream can be read again from where it stands.
+
+    One may say it seeks and then fail to: a wrapper can answer seekable() without asking what it wraps. Nothing has
+    been read from it when the seek fails here, so it can still be copied like any other stream that does not seek.
+    """
+    seekable = getattr(stream, "seekable", None)
+    if seekable is None or not seekable():
+        return False
+    try:
+        stream.seek(stream.tell())
+    except OSError:
+        return False
+    return True
 
 
 def _guess_content_type(filename: str, content_type: str | None) -> str:
@@ -89,8 +115,7 @@ def open_source(
         name = getattr(source, "name", None)
         if not filename and not owned and isinstance(name, str):
             filename = os.path.basename(name)
-        seekable = getattr(stream, "seekable", None)
-        if seekable is None or not seekable():
+        if not _rewinds(stream):
             stream, owned = _spool(iter(lambda: source.read(CHUNK_BYTES), b"")), True
     elif isinstance(source, Iterable) and not isinstance(source, bytes | bytearray):
         stream, owned = _spool(source), True

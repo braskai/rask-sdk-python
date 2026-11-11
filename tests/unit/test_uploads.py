@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import tempfile
 import threading
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 import httpx
 import pytest
 
+import rask_sdk._flow as flow_module
 from rask_sdk import AsyncRask, Rask, RaskConfigError, UploadError, models
 
 KEY = "raskai_test_key_unit"
@@ -133,6 +135,97 @@ def test_unseekable_stream_is_spooled() -> None:
     client_for(backend).uploads.upload_file(Pipe(), filename="p.mp4", content_type="video/mp4")  # type: ignore[arg-type]
     assert backend.created["size_bytes"] == len(DATA)
     assert backend.put_bytes == DATA
+
+
+def upload(kind: str, handler: Any, source: Any, **kwargs: Any) -> Any:
+    """upload_file on the sync or the async client."""
+    if kind == "sync":
+        with httpx.Client(transport=httpx.MockTransport(handler)) as http:
+            return Rask(api_key=KEY, base_url=BASE, http_client=http).uploads.upload_file(source, **kwargs)
+
+    async def drive() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+            return await AsyncRask(api_key=KEY, base_url=BASE, http_client=http).uploads.upload_file(source, **kwargs)
+
+    return asyncio.run(drive())
+
+
+class SaysItSeeks(io.RawIOBase):
+    """A stream that answers seekable() with yes and then fails to seek: a wrapper that never asked what it wraps."""
+
+    def __init__(self, tells: bool) -> None:
+        self.inner = io.BytesIO(DATA)
+        self.tells = tells
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        if not self.tells:
+            raise OSError(29, "Illegal seek")
+        return self.inner.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        raise io.UnsupportedOperation("seek")
+
+    def read(self, size: int = -1) -> bytes:
+        return self.inner.read(size)
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("tells", [False, True], ids=["tell fails", "seek fails"])
+def test_a_stream_that_says_it_seeks_and_cannot_is_spooled(
+    kind: str, tells: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nothing has been read from it when the seek fails, so it is copied like a pipe. A retried PUT reads the copy."""
+    monkeypatch.setattr(flow_module, "backoff_seconds", lambda attempt: 0.0)
+    backend = Backend()
+    puts: list[bytes] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method != "PUT":
+            return backend(request)
+        puts.append(request.read())
+        return httpx.Response(503 if len(puts) == 1 else 200)
+
+    upload(kind, handler, SaysItSeeks(tells), filename="p.mp4", content_type="video/mp4")
+    assert backend.created["size_bytes"] == len(DATA)
+    assert puts == [DATA, DATA]
+
+
+@pytest.mark.parametrize(
+    ("kind", "asynchronous"),
+    [("sync", False), ("async", False), ("async", True)],
+    ids=["sync", "async", "async, from an async iterable"],
+)
+def test_a_copy_that_fails_leaves_no_spool_open(kind: str, asynchronous: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Left to the garbage collector, the copy keeps its descriptor and disk space for as long as the error is held."""
+    made: list[Any] = []
+    real = tempfile.SpooledTemporaryFile
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        made.append(real(*args, **kwargs))
+        return made[-1]
+
+    monkeypatch.setattr(tempfile, "SpooledTemporaryFile", recording)
+
+    def broken() -> Iterator[bytes]:
+        yield DATA
+        raise OSError("the source broke")
+
+    async def broken_async() -> AsyncIterator[bytes]:
+        yield DATA
+        raise OSError("the source broke")
+
+    backend = Backend()
+    source = broken_async() if asynchronous else broken()
+    with pytest.raises(OSError, match="the source broke"):
+        upload(kind, backend, source, filename="i.mp4", content_type="video/mp4")
+    assert backend.calls == []
+    assert [spool.closed for spool in made] == [True]
 
 
 def test_stream_uploads_from_its_current_position() -> None:

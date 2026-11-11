@@ -12,7 +12,8 @@ from typing import Any
 import httpx
 import pytest
 
-from rask_sdk import AsyncRask, Rask, RaskConfigError, RaskError
+from rask_sdk import AsyncRask, Rask, RaskConfigError, RaskConnectionError, RaskError
+from rask_sdk._flow import _redirect_target
 from rask_sdk._generated.operations import OPERATIONS
 
 KEY = "raskai_test_key_unit"
@@ -233,6 +234,59 @@ def test_a_redirect_loop_ends() -> None:
         Rask(api_key=KEY, base_url=BASE, http_client=http).account.get_me()
     assert caught.value.status == 302
     assert len(seen) == 4
+
+
+def _get_me(kind: str, transport: httpx.MockTransport, **kwargs: Any) -> Any:
+    if kind == "sync":
+        with httpx.Client(transport=transport) as http:
+            return Rask(api_key=KEY, base_url=BASE, http_client=http, **kwargs).account.get_me()
+
+    async def drive() -> Any:
+        async with httpx.AsyncClient(transport=transport) as http:
+            return await AsyncRask(api_key=KEY, base_url=BASE, http_client=http, **kwargs).account.get_me()
+
+    return asyncio.run(drive())
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize(
+    "location",
+    ["http:///rask/v3/me", "https://gw.example.com:99999/rask/v3/me"],
+    ids=["no host", "a port no socket has"],
+)
+def test_a_redirect_no_request_can_be_made_of_is_the_answer(kind: str, location: str) -> None:
+    """Sent on, it fails inside the HTTP client like a network that is down, and would be retried as one."""
+    transport, seen = _redirecting(location)
+    with pytest.raises(RaskError) as caught:
+        _get_me(kind, transport)
+    assert caught.value.status == 307
+    assert len(seen) == 1
+
+
+def test_where_a_redirect_leads() -> None:
+    here = f"{BASE}/me"
+    assert _redirect_target(here, "me2") == f"{BASE}/me2"
+    assert _redirect_target(here, "https://other.example.com:8443/x?y=1") == "https://other.example.com:8443/x?y=1"
+    # httpx makes its own request of a redirect before the SDK sees it, and raises on these two. Should it stop, they
+    # are still no target.
+    assert _redirect_target(here, "http://[::1") is None
+    assert _redirect_target(here, "https://gw.example.com:port/") is None
+    assert _redirect_target(here, "ftp://gw.example.com/x") is None
+    assert _redirect_target(here, "http:///rask/v3/me") is None
+    assert _redirect_target(here, "https://gw.example.com:65536/") is None
+    assert _redirect_target(here, "https://gw.example.com:65535/") == "https://gw.example.com:65535/"
+
+
+@pytest.mark.parametrize("kind", ["sync", "async"])
+@pytest.mark.parametrize("location", ["http://[::1", "https://gw.example.com:port/rask/v3/me"])
+def test_a_location_that_is_no_url_is_not_retried(kind: str, location: str) -> None:
+    """httpx refuses it before the SDK sees the response. The next attempt would get the same Location."""
+    transport, seen = _redirecting(location)
+    with pytest.raises(RaskConnectionError) as caught:
+        _get_me(kind, transport, max_retries=2)
+    assert len(seen) == 1
+    assert isinstance(caught.value.__cause__, httpx.RemoteProtocolError)
+    assert "location" in str(caught.value.__cause__).lower()
 
 
 def test_a_client_that_follows_redirects_itself_cannot_override_the_policy() -> None:
